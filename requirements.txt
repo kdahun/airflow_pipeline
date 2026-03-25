@@ -1,0 +1,4 @@
+cassandra-driver
+pyasyncore
+requests
+matplotlib
