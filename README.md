@@ -33,3 +33,22 @@ docker compose up airflow-init
 # 4. 서비스 실행
 
 docker compose up -d airflow-webserver airflow-scheduler
+
+# Airflow 스케줄러 컨테이너 이름 확인
+
+docker ps --format "table {{.Names}}" | grep airflow
+
+# Airflow 컨테이너 안에서 직접 연결 테스트
+
+docker exec -it airflow_pipeline-airflow-scheduler-1 python -c "
+from cassandra.cluster import Cluster
+try:
+c = Cluster(['dlim-cassandra-1'], port=9042)
+s = c.connect('dlim')
+print('연결 성공')
+s.execute('SELECT mmsi FROM ais_class_a_dynamic LIMIT 1')
+print('쿼리 성공')
+c.shutdown()
+except Exception as e:
+print(f'오류: {type(e).**name**}: {e}')
+"
