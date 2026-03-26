@@ -12,6 +12,8 @@ x-airflow-common: &airflow-common
     PYTHONPATH: /opt/airflow/scripts/process:/opt/airflow/scripts/analysis
     WEBHDFS_HOST: ${WEBHDFS_HOST}
     CASSANDRA_HOST: ${CASSANDRA_HOST}
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Seoul
+    AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: Asia/Seoul
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
@@ -19,6 +21,8 @@ x-airflow-common: &airflow-common
     - ./scripts:/opt/airflow/scripts
   networks:
     - all4land_net
+    - workspace_lambda-net
+    - cassandra_dlim-cassandra-net
 
 services:
   # DB 초기화 (최초 1회 실행)
@@ -80,4 +84,8 @@ services:
 
 networks:
   all4land_net:
-    external: true # 기존 네트워크 사용
+    external: true # PostgreSQL 네트워크
+  workspace_lambda-net:
+    external: true # namenode(HDFS)가 속한 네트워크
+  cassandra_dlim-cassandra-net:
+    external: true # Cassandra가 속한 네트워크

@@ -1,1 +1,4 @@
 logs/
+dags/__pycache__/data_pipeline.cpython-312.pyc
+scripts/analysis/__pycache__/report_analysis.cpython-312.pyc
+scripts/analysis/__pycache__/rssi_analysis.cpython-312.pyc

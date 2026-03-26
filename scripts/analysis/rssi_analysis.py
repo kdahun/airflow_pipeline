@@ -71,17 +71,20 @@ def _load_from_cassandra(
         conditions: list[str] = []
 
         if start_dt is not None:
-            conditions.append("date_bucket >= %s")
-            params.append(start_dt)
+            conditions.append("date_bucket >= ?")
+            params.append(start_dt.replace(tzinfo=None))
         if end_dt is not None:
-            conditions.append("date_bucket <= %s")
-            params.append(end_dt)
+            conditions.append("date_bucket <= ?")
+            params.append(end_dt.replace(tzinfo=None))
 
         if conditions:
-            cql += " WHERE " + " AND ".join(conditions) + " ALLOW FILTERING"
+            cql += " WHERE " + " AND ".join(conditions)
         cql += f" LIMIT {limit}"
+        if conditions:
+            cql += " ALLOW FILTERING"
 
-        stmt = SimpleStatement(cql, fetch_size=1000)
+        stmt = session.prepare(cql)
+        stmt.fetch_size = 1000
         result = session.execute(stmt, params)
         rows = [
             {

@@ -10,7 +10,8 @@ AIS 데이터 파이프라인 DAG
 """
 
 import logging
-from datetime import datetime
+
+import pendulum
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -22,16 +23,28 @@ import rssi_analysis
 
 logger = logging.getLogger(__name__)
 
+KST = pendulum.timezone("Asia/Seoul")
+
 
 # ──────────────────────────────────────────────────────────────
 # Task callable 함수
 # ──────────────────────────────────────────────────────────────
 
 def run_process(**context) -> None:
-    """HDFS에서 data_interval_start 시점의 10분 데이터를 읽어 Cassandra에 저장한다."""
-    data_interval_start: datetime = context["data_interval_start"]
+    """HDFS에서 가장 최근에 완성된 10분 버킷의 데이터를 읽어 Cassandra에 저장한다.
 
-    hdfs_path = mmsi_summary.get_hdfs_path(data_interval_start)
+    5분 전 시각을 기준으로 10분 단위 내림(floor)을 적용한다.
+    - 스케줄 실행(10:20:05) → 10:15 → floor → 10:10 버킷
+    - 수동 실행(10:25)     → 10:20 → floor → 10:20 버킷
+    """
+    now_kst = pendulum.now(KST)
+    ref_kst = now_kst.subtract(minutes=5)
+    floored_minute = (ref_kst.minute // 10) * 10
+    target_kst = ref_kst.replace(minute=floored_minute, second=0, microsecond=0)
+
+    hdfs_path = mmsi_summary.get_hdfs_path(target_kst)
+    logger.info("현재 시각(KST): %s", now_kst.strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info("대상 버킷(KST): %s", target_kst.strftime("%Y-%m-%d %H:%M:%S"))
     logger.info("HDFS 경로: %s", hdfs_path)
 
     if not hdfs_reader.check_connection():
@@ -52,21 +65,23 @@ def run_process(**context) -> None:
 
 
 def run_report(**context) -> None:
-    """슬롯 검증 분석을 실행한다."""
-    data_interval_start: datetime = context["data_interval_start"]
-    data_interval_end: datetime = context["data_interval_end"]
+    """슬롯 검증 분석을 실행한다 (현재 시각 KST 기준 최근 10분)."""
+    now_kst = pendulum.now(KST)
+    end_dt = now_kst
+    start_dt = now_kst.subtract(minutes=10)
 
-    logger.info("Report 분석: %s ~ %s", data_interval_start, data_interval_end)
-    report_analysis.run(start_dt=data_interval_start, end_dt=data_interval_end)
+    logger.info("Report 분석: %s ~ %s (KST)", start_dt, end_dt)
+    report_analysis.run(start_dt=start_dt, end_dt=end_dt)
 
 
 def run_rssi(**context) -> None:
-    """RSSI/SNR 분석을 실행한다."""
-    data_interval_start: datetime = context["data_interval_start"]
-    data_interval_end: datetime = context["data_interval_end"]
+    """RSSI/SNR 분석을 실행한다 (현재 시각 KST 기준 최근 10분)."""
+    now_kst = pendulum.now(KST)
+    end_dt = now_kst
+    start_dt = now_kst.subtract(minutes=10)
 
-    logger.info("RSSI 분석: %s ~ %s", data_interval_start, data_interval_end)
-    rssi_analysis.run(start_dt=data_interval_start, end_dt=data_interval_end)
+    logger.info("RSSI 분석: %s ~ %s (KST)", start_dt, end_dt)
+    rssi_analysis.run(start_dt=start_dt, end_dt=end_dt)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -76,7 +91,7 @@ def run_rssi(**context) -> None:
 with DAG(
     dag_id="ais_data_pipeline",
     schedule="*/10 * * * *",
-    start_date=datetime(2026, 3, 25),
+    start_date=pendulum.today(KST),
     catchup=False,
     tags=["ais", "pipeline"],
 ) as dag:
