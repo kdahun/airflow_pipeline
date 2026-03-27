@@ -9,7 +9,9 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: 30
-    PYTHONPATH: /opt/airflow/scripts/process:/opt/airflow/scripts/analysis
+    PYTHONPATH: /opt/airflow/scripts/process:/opt/airflow/scripts/analysis:/opt/airflow/scripts/spark
+    JAVA_HOME: /usr/lib/jvm/default-java
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077}'
     WEBHDFS_HOST: ${WEBHDFS_HOST}
     CASSANDRA_HOST: ${CASSANDRA_HOST}
     AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Seoul

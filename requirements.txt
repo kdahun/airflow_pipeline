@@ -2,3 +2,5 @@ cassandra-driver
 pyasyncore
 requests
 matplotlib
+pyspark==3.5.0
+apache-airflow-providers-apache-spark
