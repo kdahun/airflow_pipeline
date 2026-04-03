@@ -47,9 +47,9 @@ BASE_LAT = 35.080532
 BASE_LON = 129.077486
 
 # 거리 구간 정의 (km)
-DIST_BINS   = [0, 5, 10, 20, 40, float("inf")]
-DIST_LABELS = ["0~5 km", "5~10 km", "10~20 km", "20~40 km", "40 km+"]
-DIST_COLORS = ["#e74c3c", "#e67e22", "#f1c40f", "#2ecc71", "#3498db"]
+DIST_BINS   = [0, 10, 20, 30, 40, float("inf")]
+DIST_LABELS = ["0~10 km", "10~20 km", "20~30 km", "30~40 km", "40 km+"]
+DIST_COLORS = ["#e74c3c", "#f1c40f", "#2ecc71", "#3498db", "#9b59b6"]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -217,13 +217,14 @@ def run(start_dt: datetime, end_dt: datetime) -> None:
     bar_colors = mmsi_stats["dist_band"].astype(object).map(band_color_map).fillna("#aaaaaa")
     n_mmsi = len(mmsi_stats)
 
-    # ── 레이아웃: GridSpec 4행 2열 ────────────────────────────────────
+    # ── 레이아웃: GridSpec 5행 2열 ────────────────────────────────────
     # Row 0: RSSI 시계열 (전체 폭)
     # Row 1: SNR  시계열 (전체 폭)
     # Row 2: 거리 산점도 | 거리 Box plot
     # Row 3: MMSI 바 차트 | RSSI 히스토그램
+    # Row 4: MMSI별 RSSI 원시 시계열 | MMSI별 SNR 원시 시계열
     mmsi_row_h = max(4, n_mmsi * 0.28)
-    fig_h = 9 + 5 + mmsi_row_h          # 시계열 9 + 거리분석 5 + MMSI행
+    fig_h = 9 + 5 + mmsi_row_h + 4      # 시계열 9 + 거리분석 5 + MMSI행 + 원시 시계열 4
     fig = plt.figure(figsize=(20, fig_h))
     fig.suptitle(
         f"AIS RSSI Analysis  |  {start_dt.strftime('%Y-%m-%d %H:%M')} ~ "
@@ -232,17 +233,19 @@ def run(start_dt: datetime, end_dt: datetime) -> None:
     )
 
     gs = fig.add_gridspec(
-        4, 2,
-        height_ratios=[1, 1, 1.1, mmsi_row_h / 4.5],
+        5, 2,
+        height_ratios=[1, 1, 1.1, mmsi_row_h / 4.5, 1],
         hspace=0.55, wspace=0.32,
     )
 
-    ax_rssi = fig.add_subplot(gs[0, :])
-    ax_snr  = fig.add_subplot(gs[1, :], sharex=ax_rssi)
-    ax_scat = fig.add_subplot(gs[2, 0])
-    ax_box  = fig.add_subplot(gs[2, 1])
-    ax_bar  = fig.add_subplot(gs[3, 0])
-    ax_hist = fig.add_subplot(gs[3, 1])
+    ax_rssi     = fig.add_subplot(gs[0, :])
+    ax_snr      = fig.add_subplot(gs[1, :], sharex=ax_rssi)
+    ax_scat     = fig.add_subplot(gs[2, 0])
+    ax_box      = fig.add_subplot(gs[2, 1])
+    ax_bar      = fig.add_subplot(gs[3, 0])
+    ax_hist     = fig.add_subplot(gs[3, 1])
+    ax_rssi_raw = fig.add_subplot(gs[4, 0])
+    ax_snr_raw  = fig.add_subplot(gs[4, 1])
 
     # ── [1] RSSI 시계열 ──────────────────────────────────────────────
     for band, color in zip(DIST_LABELS, DIST_COLORS):
@@ -354,6 +357,37 @@ def run(start_dt: datetime, end_dt: datetime) -> None:
     ax_hist.set_title("RSSI histogram by distance band")
     ax_hist.legend(fontsize=8)
     ax_hist.grid(True, alpha=0.3, axis="y")
+
+    # ── [7] 전체 RSSI 원시 시계열 (시간순 단일 선) ──────────────────
+    raw_sorted = df_sort.sort_values("date_bucket")
+    ax_rssi_raw.plot(
+        raw_sorted["date_bucket"], raw_sorted["rssi"],
+        color="#3498db", linewidth=1.0, alpha=0.8,
+        marker="o", markersize=2,
+    )
+    ax_rssi_raw.axhline(rssi_mean, color="black", linestyle="--", linewidth=1,
+                        label=f"overall avg: {rssi_mean:.1f} dBm")
+    ax_rssi_raw.set_xlabel("received time (UTC)")
+    ax_rssi_raw.set_ylabel("RSSI (dBm)")
+    ax_rssi_raw.set_title("RSSI time series (raw, all vessels)")
+    ax_rssi_raw.legend(fontsize=8, loc="upper right")
+    ax_rssi_raw.grid(True, alpha=0.3)
+    ax_rssi_raw.tick_params(axis="x", rotation=30)
+
+    # ── [8] 전체 SNR 원시 시계열 (시간순 단일 선) ───────────────────
+    ax_snr_raw.plot(
+        raw_sorted["date_bucket"], raw_sorted["snr"],
+        color="#e67e22", linewidth=1.0, alpha=0.8,
+        marker="o", markersize=2,
+    )
+    ax_snr_raw.axhline(snr_mean, color="black", linestyle="--", linewidth=1,
+                       label=f"overall avg: {snr_mean:.1f} dB")
+    ax_snr_raw.set_xlabel("received time (UTC)")
+    ax_snr_raw.set_ylabel("SNR (dB)")
+    ax_snr_raw.set_title("SNR time series (raw, all vessels)")
+    ax_snr_raw.legend(fontsize=8, loc="upper right")
+    ax_snr_raw.grid(True, alpha=0.3)
+    ax_snr_raw.tick_params(axis="x", rotation=30)
 
     # ── PNG 저장 (파일 1개) ──────────────────────────────────────────
     chart_dir = Path(CHART_DIR)

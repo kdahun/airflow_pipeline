@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Optional
 
 import pandas as pd
+from cassandra import ReadFailure
 from cassandra.cluster import Cluster, NoHostAvailable
 from cassandra.policies import DCAwareRoundRobinPolicy
 from cassandra.query import SimpleStatement
@@ -79,24 +80,31 @@ def _load_from_cassandra(
 
         stmt = session.prepare(cql)
         stmt.fetch_size = 1000
-        result = session.execute(stmt, params)
-        rows = [
-            {
-                "mmsi": row.mmsi,
-                "date_bucket": row.date_bucket,
-                "received_at": row.received_at,
-                "msg_type": row.msg_type,
-                "sog": row.sog,
-                "cog": row.cog,
-                "nav_status": row.nav_status,
-                "longitude": row.longitude,
-                "latitude": row.latitude,
-                "rssi": row.rssi,
-                "slot_num": row.slot_num,
-                "snr": row.snr,
-            }
-            for row in result
-        ]
+        try:
+            result = session.execute(stmt, params)
+            rows = [
+                {
+                    "mmsi": row.mmsi,
+                    "date_bucket": row.date_bucket,
+                    "received_at": row.received_at,
+                    "msg_type": row.msg_type,
+                    "sog": row.sog,
+                    "cog": row.cog,
+                    "nav_status": row.nav_status,
+                    "longitude": row.longitude,
+                    "latitude": row.latitude,
+                    "rssi": row.rssi,
+                    "slot_num": row.slot_num,
+                    "snr": row.snr,
+                }
+                for row in result
+            ]
+        except ReadFailure as exc:
+            logger.error(
+                "[Cassandra] ReadFailure — tombstone 초과로 읽기 실패. "
+                "nodetool compact 실행 또는 스키마 재설계 필요. 원인: %s", exc
+            )
+            rows = []
     finally:
         cluster.shutdown()
 
