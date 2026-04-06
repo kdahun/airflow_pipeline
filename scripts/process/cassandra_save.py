@@ -9,14 +9,14 @@ Cassandra 연결 및 AIS 레코드 저장 전담 모듈
   cassandra_save.save_record(record)   # AIS JSON 레코드 1건 저장
   cassandra_save.close()               # 프로그램 종료 전 반드시 호출
 
-저장 대상:
+저장 대상 (messageId / data.messageId 기준 분기):
   keyspace : dlim
-  table    : ais_class_a_dynamic
+  ais_class_a_dynamic — AIS 타입 1, 3 (위치·동적)
+  ais_static_voyage   — AIS 타입 5 (정적·항차)
 
-JSON 필드 → Cassandra 컬럼 매핑:
+ais_class_a_dynamic 매핑 (타입 1, 3):
   (outer) messageId           → msg_type        int
-  (outer) data_bucket         → date_bucket      date
-  (outer) data_bucket         → received_at      timestamp
+  (outer) dataBucket          → date_bucket      date
   data.mmsi                   → mmsi             text
   data.cog                    → cog              float
   data.positionAccuracy       → integrity_flag   int
@@ -28,7 +28,24 @@ JSON 필드 → Cassandra 컬럼 매핑:
   data.sog                    → sog              float
   data.timeStamp              → timestamp_sec    int
   data.trueHeading            → true_heading     int
-  (없음)                      → coast_mmsi       null
+  received_at                 → now()            timestamp
+  vsi.*                       → rssi, slot_num, snr
+
+ais_static_voyage 매핑 (타입 5):
+  data.mmsi                   → mmsi
+  data.callSign               → call_sign
+  data.destination            → destination
+  data.draught                → draught
+  data.imoNumber              → imo_number (text)
+  data.shipType               → ship_type
+  data.shipName               → vessel_name
+  data.dte                    → integrity_flag (있을 때만)
+  data.etaMonth/Day/Hour/Min  → eta (dataBucket 연도 기준, 보정)
+  (선택) coastMmsi 등         → coast_mmsi
+  received_at                 → now()
+  msg_type                    → 5
+
+그 외 메시지 타입은 INSERT 하지 않습니다.
 
 의존 패키지:
   pip install cassandra-driver pyasyncore
@@ -47,6 +64,7 @@ CASSANDRA_HOST     = os.getenv("CASSANDRA_HOST", "localhost")
 CASSANDRA_PORT     = 9042
 CASSANDRA_KEYSPACE = "dlim"
 CASSANDRA_TABLE    = "ais_class_a_dynamic"
+CASSANDRA_TABLE_STATIC = "ais_static_voyage"
 
 # ──────────────────────────────────────────────────────────────
 # 싱글턴 — 모듈 전체에서 연결 1회만 생성
@@ -93,6 +111,109 @@ def _parse_data_bucket(raw: str | None) -> datetime | None:
             return None
 
 
+def _compose_eta_msg5(payload: dict, db_dt: datetime | None) -> datetime | None:
+    """
+    AIS 타입 5의 etaMonth/Day/Hour/Minute → timestamp.
+    연도는 dataBucket 시각이 있으면 그 해를 기준으로 하고,
+    ETA가 수신 시각보다 이전이면 다음 해를 시도합니다.
+    AIS에서 0·24·60 등은 '미정' 값입니다.
+    """
+    mo = _to_int(payload.get("etaMonth"))
+    d = _to_int(payload.get("etaDay"))
+    h = _to_int(payload.get("etaHour"))
+    mi = _to_int(payload.get("etaMinute"))
+    if mo is None or d is None or h is None or mi is None:
+        return None
+    if mo <= 0 or d <= 0 or h >= 24 or mi >= 60:
+        return None
+
+    base = db_dt or datetime.now()
+    base_cmp = base.replace(microsecond=0)
+
+    year = base.year
+    for _ in range(2):
+        try:
+            eta = datetime(year, mo, d, h, mi)
+        except ValueError:
+            return None
+        if eta >= base_cmp:
+            return eta
+        year += 1
+    return None
+
+
+def _save_static_voyage(record: dict, payload: dict) -> None:
+    """AIS 타입 5 → ais_static_voyage 동적 INSERT."""
+    session = _get_session()
+
+    mmsi_raw = _to_int(payload.get("mmsi") or payload.get("userId"))
+    mmsi = str(mmsi_raw) if mmsi_raw is not None else None
+
+    db_str = record.get("dataBucket")
+    db_dt = _parse_data_bucket(db_str)
+    received_at = datetime.now()
+
+    call_sign = payload.get("callSign")
+    if call_sign is not None and not isinstance(call_sign, str):
+        call_sign = str(call_sign)
+
+    destination = payload.get("destination")
+    if destination is not None and not isinstance(destination, str):
+        destination = str(destination)
+
+    draught = _to_float(payload.get("draught"))
+    eta = _compose_eta_msg5(payload, db_dt)
+
+    imo_number = None
+    imo_raw = payload.get("imoNumber")
+    if imo_raw is not None:
+        try:
+            imo_number = str(int(float(imo_raw)))
+        except (TypeError, ValueError):
+            s = str(imo_raw).strip()
+            if s:
+                imo_number = s
+
+    integrity_flag = _to_int(payload.get("dte"))
+    msg_type = 5
+    ship_type = _to_int(payload.get("shipType"))
+
+    vessel_name = payload.get("shipName")
+    if vessel_name is not None and not isinstance(vessel_name, str):
+        vessel_name = str(vessel_name)
+
+    coast_raw = payload.get("coastMmsi") or payload.get("coast_mmsi")
+    coast_mmsi = str(_to_int(coast_raw)) if coast_raw is not None and _to_int(coast_raw) is not None else None
+
+    col_val_pairs = [
+        ("mmsi", mmsi),
+        ("received_at", received_at),
+        ("call_sign", call_sign),
+        ("coast_mmsi", coast_mmsi),
+        ("destination", destination),
+        ("draught", draught),
+        ("eta", eta),
+        ("imo_number", imo_number),
+        ("integrity_flag", integrity_flag),
+        ("msg_type", msg_type),
+        ("ship_type", ship_type),
+        ("vessel_name", vessel_name),
+    ]
+    non_null = [(col, val) for col, val in col_val_pairs if val is not None]
+    if not non_null:
+        return
+
+    cols = ", ".join(col for col, _ in non_null)
+    params = [val for _, val in non_null]
+    cql = (
+        f"INSERT INTO {CASSANDRA_TABLE_STATIC} ({cols}) "
+        f"VALUES ({', '.join(['?'] * len(non_null))})"
+    )
+
+    stmt = session.prepare(cql)
+    session.execute(stmt, params)
+
+
 def _get_session() -> tuple:
     """
     Cassandra 세션을 반환합니다. 최초 호출 시에만 연결합니다 (싱글턴).
@@ -113,38 +234,41 @@ def _get_session() -> tuple:
 
 def save_record(record: dict) -> None:
     """
-    AIS JSON 레코드 1건을 ais_class_a_dynamic 테이블에 INSERT합니다.
+    AIS JSON 레코드 1건을 메시지 타입에 따라 INSERT합니다.
+    타입 1·3 → ais_class_a_dynamic, 타입 5 → ais_static_voyage, 그 외 → 생략.
     NULL 값인 컬럼은 INSERT 목록에서 제외해 tombstone 생성을 방지합니다.
 
-    record 구조:
+    record 구조 예:
       {
         "messageId": 1.0,
         "dataBucket": "2026-03-20-12:50:21.494",
-        "data": {
-          "mmsi": 5.38007769E8,
-          "cog": 1969.0,
-          ...
-        }
+        "data": { "messageId": 3, "mmsi": ..., ... }
       }
     """
     try:
+        payload = record.get("data") or record
+        msg_type = _to_int(record.get("messageId") or payload.get("messageId"))
+
+        if msg_type == 5:
+            _save_static_voyage(record, payload)
+            return
+        if msg_type not in (1, 3):
+            return
+
         session = _get_session()
 
-        payload = record.get("data") or record
-        vsi     = record.get("vsi") or {}
+        vsi = record.get("vsi") or {}
 
         # mmsi: text
         mmsi_raw = _to_int(payload.get("mmsi") or payload.get("userId"))
-        mmsi     = str(mmsi_raw) if mmsi_raw is not None else None
+        mmsi = str(mmsi_raw) if mmsi_raw is not None else None
 
         db_str = record.get("dataBucket")
-        db_dt  = _parse_data_bucket(db_str)
+        db_dt = _parse_data_bucket(db_str)
         date_bucket = db_dt
         received_at = datetime.now()
 
-        msg_type = _to_int(record.get("messageId") or payload.get("messageId"))
-
-        cog       = _to_float(payload.get("cog"))
+        cog = _to_float(payload.get("cog"))
         integrity = _to_int(payload.get("positionAccuracy"))
 
         raw_lat = _to_float(payload.get("latitude"))
@@ -155,43 +279,43 @@ def save_record(record: dict) -> None:
         nav_status = _to_int(
             payload.get("navigationalStatus") or payload.get("navigationStatus")
         )
-        raim_flag     = bool(payload.get("raimFlag")) if payload.get("raimFlag") is not None else None
-        rot           = _to_float(payload.get("rateOfTurn"))
-        sog           = _to_float(payload.get("sog") or payload.get("speedOverGround"))
+        raim_flag = bool(payload.get("raimFlag")) if payload.get("raimFlag") is not None else None
+        rot = _to_float(payload.get("rateOfTurn"))
+        sog = _to_float(payload.get("sog") or payload.get("speedOverGround"))
         timestamp_sec = _to_int(payload.get("timeStamp") or payload.get("timestamp_sec"))
-        true_heading  = _to_int(payload.get("trueHeading"))
+        true_heading = _to_int(payload.get("trueHeading"))
 
-        rssi     = _to_float(vsi.get("rssi"))
+        rssi = _to_float(vsi.get("rssi"))
         slot_num = _to_int(vsi.get("slotNum"))
-        snr      = _to_float(vsi.get("snr"))
+        snr = _to_float(vsi.get("snr"))
 
         # NULL 컬럼을 제외한 동적 INSERT — NULL을 넣으면 Cassandra tombstone이 생성됨
         col_val_pairs = [
-            ("mmsi",           mmsi),
-            ("date_bucket",    date_bucket),
-            ("received_at",    received_at),
-            ("msg_type",       msg_type),
-            ("cog",            cog),
+            ("mmsi", mmsi),
+            ("date_bucket", date_bucket),
+            ("received_at", received_at),
+            ("msg_type", msg_type),
+            ("cog", cog),
             ("integrity_flag", integrity),
-            ("latitude",       lat),
-            ("longitude",      lon),
-            ("nav_status",     nav_status),
-            ("raim_flag",      raim_flag),
-            ("rot",            rot),
-            ("sog",            sog),
-            ("timestamp_sec",  timestamp_sec),
-            ("true_heading",   true_heading),
-            ("rssi",           rssi),
-            ("slot_num",       slot_num),
-            ("snr",            snr),
+            ("latitude", lat),
+            ("longitude", lon),
+            ("nav_status", nav_status),
+            ("raim_flag", raim_flag),
+            ("rot", rot),
+            ("sog", sog),
+            ("timestamp_sec", timestamp_sec),
+            ("true_heading", true_heading),
+            ("rssi", rssi),
+            ("slot_num", slot_num),
+            ("snr", snr),
         ]
         non_null = [(col, val) for col, val in col_val_pairs if val is not None]
         if not non_null:
             return
 
-        cols   = ", ".join(col for col, _ in non_null)
+        cols = ", ".join(col for col, _ in non_null)
         params = [val for _, val in non_null]
-        cql    = f"INSERT INTO {CASSANDRA_TABLE} ({cols}) VALUES ({', '.join(['?'] * len(non_null))})"
+        cql = f"INSERT INTO {CASSANDRA_TABLE} ({cols}) VALUES ({', '.join(['?'] * len(non_null))})"
 
         stmt = session.prepare(cql)
         session.execute(stmt, params)
