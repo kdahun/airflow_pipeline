@@ -33,14 +33,16 @@ logger = logging.getLogger(__name__)
 CASSANDRA_HOST = os.getenv("CASSANDRA_HOST", "localhost")
 CASSANDRA_PORT = 9042
 CASSANDRA_KEYSPACE = "dlim"
-CASSANDRA_TABLE = "ais_class_a_dynamic"
+CASSANDRA_TABLE_DYNAMIC = "ais_class_a_dynamic"
+CASSANDRA_TABLE_SIGNAL  = "signal_information"
 
 CHART_DIR = os.getenv("RSSI_CHART_DIR", "/opt/airflow/logs/rssi")
 
-COLUMNS = (
+COLUMNS_DYNAMIC = (
     "mmsi, date_bucket, received_at, msg_type, sog, cog, "
-    "nav_status, longitude, latitude, rssi, slot_num, snr"
+    "nav_status, longitude, latitude"
 )
+COLUMNS_SIGNAL = "mmsi, date_bucket, rssi, slot_num, snr"
 
 # 기지국 위치
 BASE_LAT = 35.080532
@@ -86,6 +88,76 @@ def _add_distance(df: pd.DataFrame) -> pd.DataFrame:
 # Cassandra 조회
 # ──────────────────────────────────────────────────────────────
 
+def _load_dynamic(session, start_dt, end_dt, limit) -> pd.DataFrame:
+    cql = f"SELECT {COLUMNS_DYNAMIC} FROM {CASSANDRA_TABLE_DYNAMIC}"
+    params: list = []
+    # msg_type IN (1, 3) — 위경도가 없는 타입 5 등 다른 메시지 명시적 제외
+    conditions: list[str] = ["msg_type IN (1, 3)"]
+
+    if start_dt is not None:
+        conditions.append("date_bucket >= ?")
+        params.append(start_dt.replace(tzinfo=None))
+    if end_dt is not None:
+        conditions.append("date_bucket <= ?")
+        params.append(end_dt.replace(tzinfo=None))
+
+    cql += " WHERE " + " AND ".join(conditions)
+    cql += f" LIMIT {limit} ALLOW FILTERING"
+
+    stmt = session.prepare(cql)
+    stmt.fetch_size = 1000
+    result = session.execute(stmt, params)
+    rows = [
+        {
+            "mmsi":        row.mmsi,
+            "date_bucket": row.date_bucket,
+            "received_at": row.received_at,
+            "msg_type":    row.msg_type,
+            "sog":         row.sog,
+            "cog":         row.cog,
+            "nav_status":  row.nav_status,
+            "longitude":   row.longitude,
+            "latitude":    row.latitude,
+        }
+        for row in result
+    ]
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=COLUMNS_DYNAMIC.replace(" ", "").split(","))
+
+
+def _load_signal(session, start_dt, end_dt, limit) -> pd.DataFrame:
+    cql = f"SELECT {COLUMNS_SIGNAL} FROM {CASSANDRA_TABLE_SIGNAL}"
+    params: list = []
+    conditions: list[str] = []
+
+    if start_dt is not None:
+        conditions.append("date_bucket >= ?")
+        params.append(start_dt.replace(tzinfo=None))
+    if end_dt is not None:
+        conditions.append("date_bucket <= ?")
+        params.append(end_dt.replace(tzinfo=None))
+
+    if conditions:
+        cql += " WHERE " + " AND ".join(conditions)
+    cql += f" LIMIT {limit}"
+    if conditions:
+        cql += " ALLOW FILTERING"
+
+    stmt = session.prepare(cql)
+    stmt.fetch_size = 1000
+    result = session.execute(stmt, params)
+    rows = [
+        {
+            "mmsi":        row.mmsi,
+            "date_bucket": row.date_bucket,
+            "slot_num":    row.slot_num,
+            "rssi":        row.rssi,
+            "snr":         row.snr,
+        }
+        for row in result
+    ]
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=COLUMNS_SIGNAL.replace(" ", "").split(","))
+
+
 def _load_from_cassandra(
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
@@ -104,58 +176,28 @@ def _load_from_cassandra(
     except NoHostAvailable as exc:
         raise RuntimeError(f"Cassandra 연결 실패: {exc}") from exc
 
-    rows: list[dict] = []
     try:
-        cql = f"SELECT {COLUMNS} FROM {CASSANDRA_TABLE}"
-        params: list = []
-        conditions: list[str] = []
-
-        if start_dt is not None:
-            conditions.append("date_bucket >= ?")
-            params.append(start_dt.replace(tzinfo=None))
-        if end_dt is not None:
-            conditions.append("date_bucket <= ?")
-            params.append(end_dt.replace(tzinfo=None))
-
-        if conditions:
-            cql += " WHERE " + " AND ".join(conditions)
-        cql += f" LIMIT {limit}"
-        if conditions:
-            cql += " ALLOW FILTERING"
-
-        stmt = session.prepare(cql)
-        stmt.fetch_size = 1000
-        result = session.execute(stmt, params)
-        rows = [
-            {
-                "mmsi": row.mmsi,
-                "date_bucket": row.date_bucket,
-                "received_at": row.received_at,
-                "msg_type": row.msg_type,
-                "sog": row.sog,
-                "cog": row.cog,
-                "nav_status": row.nav_status,
-                "longitude": row.longitude,
-                "latitude": row.latitude,
-                "rssi": row.rssi,
-                "slot_num": row.slot_num,
-                "snr": row.snr,
-            }
-            for row in result
-        ]
+        df_dynamic = _load_dynamic(session, start_dt, end_dt, limit)
+        df_signal  = _load_signal(session, start_dt, end_dt, limit)
     finally:
         cluster.shutdown()
 
-    if not rows:
-        logger.warning("[조회] 결과 없음 — 빈 DataFrame 반환")
-        return pd.DataFrame(columns=COLUMNS.replace(" ", "").split(","))
+    if df_dynamic.empty:
+        logger.warning("[조회] ais_class_a_dynamic 결과 없음 — 빈 DataFrame 반환")
+        return df_dynamic
 
-    df = pd.DataFrame(rows)
-    for col in ("date_bucket", "received_at"):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+    for df in (df_dynamic, df_signal):
+        for col in ("date_bucket", "received_at"):
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
 
-    logger.info("[조회] %s → %s건 로드 완료", CASSANDRA_TABLE, f"{len(df):,}")
+    if df_signal.empty:
+        logger.warning("[조회] signal_information 결과 없음 — dynamic 데이터만 사용")
+        df = df_dynamic
+    else:
+        df = pd.merge(df_dynamic, df_signal, on=["mmsi", "date_bucket"], how="left")
+
+    logger.info("[조회] join 완료 → %s건", f"{len(df):,}")
     return df
 
 
@@ -228,7 +270,7 @@ def run(start_dt: datetime, end_dt: datetime) -> None:
     fig = plt.figure(figsize=(20, fig_h))
     fig.suptitle(
         f"AIS RSSI Analysis  |  {start_dt.strftime('%Y-%m-%d %H:%M')} ~ "
-        f"{end_dt.strftime('%H:%M')} KST  |  total {len(df_sort):,} records",
+        f"{end_dt.strftime('%Y-%m-%d %H:%M')} KST  |  total {len(df_sort):,} records",
         fontsize=15, fontweight="bold", y=1.002,
     )
 
@@ -254,7 +296,7 @@ def run(start_dt: datetime, end_dt: datetime) -> None:
             continue
         ts_rssi = (
             df_sort.loc[mask].set_index("date_bucket")["rssi"]
-            .resample("30s").mean().dropna()
+            .resample("1min").mean().dropna()
         )
         ax_rssi.plot(ts_rssi.index, ts_rssi.values,
                      color=color, linewidth=1.8, alpha=0.9, label=band)
@@ -262,7 +304,7 @@ def run(start_dt: datetime, end_dt: datetime) -> None:
     ax_rssi.axhline(rssi_mean, color="black", linestyle="--", linewidth=1,
                     label=f"overall avg: {rssi_mean:.1f} dBm")
     ax_rssi.set_ylabel("RSSI (dBm)")
-    ax_rssi.set_title("RSSI time series  (30s avg per distance band)")
+    ax_rssi.set_title("RSSI time series  (1min avg per distance band)")
     ax_rssi.legend(fontsize=9, loc="upper right")
     ax_rssi.grid(True, alpha=0.3)
 
@@ -273,7 +315,7 @@ def run(start_dt: datetime, end_dt: datetime) -> None:
             continue
         ts_snr = (
             df_sort.loc[mask].set_index("date_bucket")["snr"]
-            .resample("30s").mean().dropna()
+            .resample("1min").mean().dropna()
         )
         ax_snr.plot(ts_snr.index, ts_snr.values,
                     color=color, linewidth=1.8, alpha=0.9, label=band)
@@ -282,7 +324,7 @@ def run(start_dt: datetime, end_dt: datetime) -> None:
                    label=f"overall avg: {snr_mean:.1f} dB")
     ax_snr.set_ylabel("SNR (dB)")
     ax_snr.set_xlabel("received time (UTC)")
-    ax_snr.set_title("SNR time series  (30s avg per distance band)")
+    ax_snr.set_title("SNR time series  (1min avg per distance band)")
     ax_snr.legend(fontsize=9, loc="upper right")
     ax_snr.grid(True, alpha=0.3)
 

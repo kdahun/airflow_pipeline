@@ -38,6 +38,11 @@ def get_hdfs_path(dt: datetime) -> str:
     return dt.strftime("/datalake/ais/%Y/%m/%d/%H/%M")
 
 
+def get_hdfs_path_hour(dt: datetime) -> str:
+    """datetime → HDFS 경로 변환 (시간 단위 — 해당 시간 전체 버킷 읽기용)."""
+    return dt.strftime("/datalake/ais/%Y/%m/%d/%H")
+
+
 # ══════════════════════════════════════════════════════════════
 # 집계 로직
 # ══════════════════════════════════════════════════════════════

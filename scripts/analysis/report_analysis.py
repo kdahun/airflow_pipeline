@@ -29,17 +29,108 @@ logger = logging.getLogger(__name__)
 CASSANDRA_HOST = os.getenv("CASSANDRA_HOST", "localhost")
 CASSANDRA_PORT = 9042
 CASSANDRA_KEYSPACE = "dlim"
-CASSANDRA_TABLE = "ais_class_a_dynamic"
+CASSANDRA_TABLE_DYNAMIC = "ais_class_a_dynamic"
+CASSANDRA_TABLE_SIGNAL  = "signal_information"
 
-COLUMNS = (
+COLUMNS_DYNAMIC = (
     "mmsi, date_bucket, received_at, msg_type, sog, cog, "
-    "nav_status, longitude, latitude, rssi, slot_num, snr"
+    "nav_status, longitude, latitude"
 )
+COLUMNS_SIGNAL = "mmsi, date_bucket, slot_num, rssi, snr"
 
 
 # ──────────────────────────────────────────────────────────────
 # Cassandra 조회
 # ──────────────────────────────────────────────────────────────
+
+def _load_dynamic(
+    session,
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+    limit: int,
+) -> pd.DataFrame:
+    cql = f"SELECT {COLUMNS_DYNAMIC} FROM {CASSANDRA_TABLE_DYNAMIC}"
+    params: list = []
+    # msg_type IN (1, 3) — 위경도가 없는 타입 5 등 다른 메시지 명시적 제외
+    conditions: list[str] = ["msg_type IN (1, 3)"]
+
+    if start_dt is not None:
+        conditions.append("date_bucket >= ?")
+        params.append(start_dt.replace(tzinfo=None))
+    if end_dt is not None:
+        conditions.append("date_bucket <= ?")
+        params.append(end_dt.replace(tzinfo=None))
+
+    cql += " WHERE " + " AND ".join(conditions)
+    cql += f" LIMIT {limit} ALLOW FILTERING"
+
+    stmt = session.prepare(cql)
+    stmt.fetch_size = 1000
+    try:
+        result = session.execute(stmt, params)
+        rows = [
+            {
+                "mmsi":        row.mmsi,
+                "date_bucket": row.date_bucket,
+                "received_at": row.received_at,
+                "msg_type":    row.msg_type,
+                "sog":         row.sog,
+                "cog":         row.cog,
+                "nav_status":  row.nav_status,
+                "longitude":   row.longitude,
+                "latitude":    row.latitude,
+            }
+            for row in result
+        ]
+    except ReadFailure as exc:
+        logger.error(
+            "[Cassandra] ReadFailure — tombstone 초과로 읽기 실패. "
+            "nodetool compact 실행 또는 스키마 재설계 필요. 원인: %s", exc
+        )
+        rows = []
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=COLUMNS_DYNAMIC.replace(" ", "").split(","))
+
+
+def _load_signal(
+    session,
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+    limit: int,
+) -> pd.DataFrame:
+    cql = f"SELECT {COLUMNS_SIGNAL} FROM {CASSANDRA_TABLE_SIGNAL}"
+    params: list = []
+    conditions: list[str] = []
+
+    if start_dt is not None:
+        conditions.append("date_bucket >= ?")
+        params.append(start_dt.replace(tzinfo=None))
+    if end_dt is not None:
+        conditions.append("date_bucket <= ?")
+        params.append(end_dt.replace(tzinfo=None))
+
+    if conditions:
+        cql += " WHERE " + " AND ".join(conditions)
+    cql += f" LIMIT {limit}"
+    if conditions:
+        cql += " ALLOW FILTERING"
+
+    stmt = session.prepare(cql)
+    stmt.fetch_size = 1000
+    result = session.execute(stmt, params)
+    rows = [
+        {
+            "mmsi":        row.mmsi,
+            "date_bucket": row.date_bucket,
+            "slot_num":    row.slot_num,
+            "rssi":        row.rssi,
+            "snr":         row.snr,
+        }
+        for row in result
+    ]
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=COLUMNS_SIGNAL.replace(" ", "").split(","))
+
 
 def _load_from_cassandra(
     start_dt: Optional[datetime] = None,
@@ -59,65 +150,28 @@ def _load_from_cassandra(
     except NoHostAvailable as exc:
         raise RuntimeError(f"Cassandra 연결 실패: {exc}") from exc
 
-    rows: list[dict] = []
     try:
-        cql = f"SELECT {COLUMNS} FROM {CASSANDRA_TABLE}"
-        params: list = []
-        conditions: list[str] = []
-
-        if start_dt is not None:
-            conditions.append("date_bucket >= ?")
-            params.append(start_dt.replace(tzinfo=None))
-        if end_dt is not None:
-            conditions.append("date_bucket <= ?")
-            params.append(end_dt.replace(tzinfo=None))
-
-        if conditions:
-            cql += " WHERE " + " AND ".join(conditions)
-        cql += f" LIMIT {limit}"
-        if conditions:
-            cql += " ALLOW FILTERING"
-
-        stmt = session.prepare(cql)
-        stmt.fetch_size = 1000
-        try:
-            result = session.execute(stmt, params)
-            rows = [
-                {
-                    "mmsi": row.mmsi,
-                    "date_bucket": row.date_bucket,
-                    "received_at": row.received_at,
-                    "msg_type": row.msg_type,
-                    "sog": row.sog,
-                    "cog": row.cog,
-                    "nav_status": row.nav_status,
-                    "longitude": row.longitude,
-                    "latitude": row.latitude,
-                    "rssi": row.rssi,
-                    "slot_num": row.slot_num,
-                    "snr": row.snr,
-                }
-                for row in result
-            ]
-        except ReadFailure as exc:
-            logger.error(
-                "[Cassandra] ReadFailure — tombstone 초과로 읽기 실패. "
-                "nodetool compact 실행 또는 스키마 재설계 필요. 원인: %s", exc
-            )
-            rows = []
+        df_dynamic = _load_dynamic(session, start_dt, end_dt, limit)
+        df_signal  = _load_signal(session, start_dt, end_dt, limit)
     finally:
         cluster.shutdown()
 
-    if not rows:
-        logger.warning("[조회] 결과 없음 — 빈 DataFrame 반환")
-        return pd.DataFrame(columns=COLUMNS.replace(" ", "").split(","))
+    if df_dynamic.empty:
+        logger.warning("[조회] ais_class_a_dynamic 결과 없음 — 빈 DataFrame 반환")
+        return df_dynamic
 
-    df = pd.DataFrame(rows)
-    for col in ("date_bucket", "received_at"):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+    for df in (df_dynamic, df_signal):
+        for col in ("date_bucket", "received_at", "toa"):
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
 
-    logger.info("[조회] %s → %s건 로드 완료", CASSANDRA_TABLE, f"{len(df):,}")
+    if df_signal.empty:
+        logger.warning("[조회] signal_information 결과 없음 — dynamic 데이터만 사용")
+        df = df_dynamic
+    else:
+        df = pd.merge(df_dynamic, df_signal, on=["mmsi", "date_bucket"], how="left")
+
+    logger.info("[조회] join 완료 → %s건", f"{len(df):,}")
     return df
 
 

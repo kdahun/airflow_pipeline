@@ -13,23 +13,36 @@ Cassandra 연결 및 AIS 레코드 저장 전담 모듈
   keyspace : dlim
   ais_class_a_dynamic — AIS 타입 1, 3 (위치·동적)
   ais_static_voyage   — AIS 타입 5 (정적·항차)
+  signal_information  — AIS 타입 1, 3 수신 시 VSI 신호 정보
 
 ais_class_a_dynamic 매핑 (타입 1, 3):
   (outer) messageId           → msg_type        int
   (outer) dataBucket          → date_bucket      date
+  (outer) stationMmsi         → station_mmsi     text
   data.mmsi                   → mmsi             text
   data.cog                    → cog              float
   data.positionAccuracy       → integrity_flag   int
-  data.latitude  ÷ 600000     → latitude         double
-  data.longitude ÷ 600000     → longitude        double
+  data.latitude               → latitude         double  (소수점 도 단위 그대로)
+  data.longitude              → longitude        double  (소수점 도 단위 그대로)
   data.navigationalStatus     → nav_status       int
   data.raimFlag               → raim_flag        boolean
   data.rateOfTurn             → rot              float
   data.sog                    → sog              float
   data.timeStamp              → timestamp_sec    int
   data.trueHeading            → true_heading     int
+  data.communicationState     → sub_message      text (JSON 직렬화)
   received_at                 → now()            timestamp
-  vsi.*                       → rssi, slot_num, snr
+
+signal_information 매핑 (타입 1, 3, 5):
+  data.mmsi                   → mmsi             text  ← partition key
+  (outer) dataBucket          → date_bucket      timestamp  ← partition key
+  received_at                 → toa              timestamp
+  (outer) stationMmsi         → station_mmsi     text
+  "AI"                        → talker_id        text
+  "VSI"                       → sentence_id      text
+  vsi.slotNum                 → slot_num         int
+  vsi.rssi                    → rssi             double
+  vsi.snr                     → snr              double
 
 ais_static_voyage 매핑 (타입 5):
   data.mmsi                   → mmsi
@@ -41,7 +54,7 @@ ais_static_voyage 매핑 (타입 5):
   data.shipName               → vessel_name
   data.dte                    → integrity_flag (있을 때만)
   data.etaMonth/Day/Hour/Min  → eta (dataBucket 연도 기준, 보정)
-  (선택) coastMmsi 등         → coast_mmsi
+  (outer) stationMmsi         → station_mmsi
   received_at                 → now()
   msg_type                    → 5
 
@@ -51,6 +64,7 @@ ais_static_voyage 매핑 (타입 5):
   pip install cassandra-driver pyasyncore
 """
 
+import json
 import os
 import sys
 from datetime import datetime
@@ -65,6 +79,7 @@ CASSANDRA_PORT     = 9042
 CASSANDRA_KEYSPACE = "dlim"
 CASSANDRA_TABLE    = "ais_class_a_dynamic"
 CASSANDRA_TABLE_STATIC = "ais_static_voyage"
+CASSANDRA_TABLE_SIGNAL = "signal_information"
 
 # ──────────────────────────────────────────────────────────────
 # 싱글턴 — 모듈 전체에서 연결 1회만 생성
@@ -142,6 +157,50 @@ def _compose_eta_msg5(payload: dict, db_dt: datetime | None) -> datetime | None:
     return None
 
 
+def _save_signal_information(record: dict, received_at: datetime) -> None:
+    """VSI 신호 정보 → signal_information 테이블 INSERT."""
+    vsi = record.get("vsi") or {}
+
+    payload = record.get("data") or record
+    mmsi_raw = _to_int(payload.get("mmsi") or payload.get("userId"))
+    mmsi = str(mmsi_raw) if mmsi_raw is not None else None
+    if not mmsi:
+        return
+
+    station_mmsi = str(record.get("stationMmsi")) if record.get("stationMmsi") is not None else None
+
+    # date_bucket: HDFS dataBucket 값 사용
+    date_bucket = _parse_data_bucket(record.get("dataBucket"))
+
+    rssi     = _to_float(vsi.get("rssi"))
+    snr      = _to_float(vsi.get("snr"))
+    slot_num = _to_int(vsi.get("slotNum"))
+
+    col_val_pairs = [
+        ("mmsi",         mmsi),
+        ("date_bucket",  date_bucket),
+        ("toa",          received_at),
+        ("station_mmsi", station_mmsi),
+        ("talker_id",    "AI"),
+        ("sentence_id",  "VSI"),
+        ("slot_num",     slot_num),
+        ("rssi",         rssi),
+        ("snr",          snr),
+    ]
+    non_null = [(col, val) for col, val in col_val_pairs if val is not None]
+
+    cols   = ", ".join(col for col, _ in non_null)
+    params = [val for _, val in non_null]
+    cql = (
+        f"INSERT INTO {CASSANDRA_TABLE_SIGNAL} ({cols}) "
+        f"VALUES ({', '.join(['?'] * len(non_null))})"
+    )
+
+    session = _get_session()
+    stmt = session.prepare(cql)
+    session.execute(stmt, params)
+
+
 def _save_static_voyage(record: dict, payload: dict) -> None:
     """AIS 타입 5 → ais_static_voyage 동적 INSERT."""
     session = _get_session()
@@ -182,22 +241,21 @@ def _save_static_voyage(record: dict, payload: dict) -> None:
     if vessel_name is not None and not isinstance(vessel_name, str):
         vessel_name = str(vessel_name)
 
-    coast_raw = payload.get("coastMmsi") or payload.get("coast_mmsi")
-    coast_mmsi = str(_to_int(coast_raw)) if coast_raw is not None and _to_int(coast_raw) is not None else None
+    station_mmsi = str(record.get("stationMmsi")) if record.get("stationMmsi") is not None else None
 
     col_val_pairs = [
         ("mmsi", mmsi),
         ("received_at", received_at),
+        ("msg_type", msg_type),
         ("call_sign", call_sign),
-        ("coast_mmsi", coast_mmsi),
         ("destination", destination),
         ("draught", draught),
         ("eta", eta),
         ("imo_number", imo_number),
         ("integrity_flag", integrity_flag),
-        ("msg_type", msg_type),
         ("ship_type", ship_type),
         ("vessel_name", vessel_name),
+        ("station_mmsi", station_mmsi),
     ]
     non_null = [(col, val) for col, val in col_val_pairs if val is not None]
     if not non_null:
@@ -212,6 +270,9 @@ def _save_static_voyage(record: dict, payload: dict) -> None:
 
     stmt = session.prepare(cql)
     session.execute(stmt, params)
+
+    # VSI 신호 정보를 signal_information 테이블에 별도 저장
+    _save_signal_information(record, received_at)
 
 
 def _get_session() -> tuple:
@@ -257,8 +318,6 @@ def save_record(record: dict) -> None:
 
         session = _get_session()
 
-        vsi = record.get("vsi") or {}
-
         # mmsi: text
         mmsi_raw = _to_int(payload.get("mmsi") or payload.get("userId"))
         mmsi = str(mmsi_raw) if mmsi_raw is not None else None
@@ -273,8 +332,8 @@ def save_record(record: dict) -> None:
 
         raw_lat = _to_float(payload.get("latitude"))
         raw_lon = _to_float(payload.get("longitude"))
-        lat = round(raw_lat / 600000, 6) if raw_lat is not None else None
-        lon = round(raw_lon / 600000, 6) if raw_lon is not None else None
+        lat = round(raw_lat, 6) if raw_lat is not None else None
+        lon = round(raw_lon, 6) if raw_lon is not None else None
 
         nav_status = _to_int(
             payload.get("navigationalStatus") or payload.get("navigationStatus")
@@ -285,9 +344,11 @@ def save_record(record: dict) -> None:
         timestamp_sec = _to_int(payload.get("timeStamp") or payload.get("timestamp_sec"))
         true_heading = _to_int(payload.get("trueHeading"))
 
-        rssi = _to_float(vsi.get("rssi"))
-        slot_num = _to_int(vsi.get("slotNum"))
-        snr = _to_float(vsi.get("snr"))
+        # communicationState (오타 키도 함께 시도) → JSON 문자열로 sub_message에 저장
+        comm_state_raw = payload.get("communicationState") or payload.get("communcation state")
+        sub_message = json.dumps(comm_state_raw, ensure_ascii=False) if comm_state_raw is not None else None
+
+        station_mmsi = str(record.get("stationMmsi")) if record.get("stationMmsi") is not None else None
 
         # NULL 컬럼을 제외한 동적 INSERT — NULL을 넣으면 Cassandra tombstone이 생성됨
         col_val_pairs = [
@@ -305,9 +366,8 @@ def save_record(record: dict) -> None:
             ("sog", sog),
             ("timestamp_sec", timestamp_sec),
             ("true_heading", true_heading),
-            ("rssi", rssi),
-            ("slot_num", slot_num),
-            ("snr", snr),
+            ("sub_message", sub_message),
+            ("station_mmsi", station_mmsi),
         ]
         non_null = [(col, val) for col, val in col_val_pairs if val is not None]
         if not non_null:
@@ -319,6 +379,9 @@ def save_record(record: dict) -> None:
 
         stmt = session.prepare(cql)
         session.execute(stmt, params)
+
+        # VSI 신호 정보를 signal_information 테이블에 별도 저장
+        _save_signal_information(record, received_at)
 
     except Exception as e:
         mmsi_val = (record.get("data") or record).get("mmsi", "?")
