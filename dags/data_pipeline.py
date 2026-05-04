@@ -2,11 +2,12 @@
 AIS 데이터 파이프라인 DAG
 =========================
 1시간마다 실행:
-  1) process_task  — HDFS에서 AIS 데이터를 읽어 Cassandra에 저장 + MMSI별 집계
-  2) report_analysis_task — 슬롯 검증 분석 (process_task 완료 후)
-  3) rssi_analysis_task   — RSSI/SNR 분석 (process_task 완료 후)
+  1) process_task           — HDFS에서 AIS 데이터를 읽어 Cassandra에 저장 + MMSI별 집계
+  2) report_analysis_task   — 슬롯 검증 분석 (process_task 완료 후)
+  3) rssi_analysis_task     — RSSI/SNR 분석 (process_task 완료 후)
+  4) msg5_integrity_task    — Type 5 무결성 분석: 보고 주기 + 선박 재원 (process_task 완료 후)
 
-2·3은 병렬 실행.
+2·3·4는 병렬 실행.
 """
 
 import logging
@@ -18,6 +19,7 @@ from airflow.operators.python import PythonOperator
 
 import hdfs_reader
 import mmsi_summary
+import msg5_integrity_analysis
 import report_analysis
 import rssi_analysis
 
@@ -83,6 +85,19 @@ def run_rssi(**context) -> None:
     rssi_analysis.run(start_dt=start_dt, end_dt=end_dt)
 
 
+def run_msg5_integrity(**context) -> None:
+    """Type 5 무결성 분석을 실행한다 (현재 시각 KST 기준 최근 1시간).
+
+    보고 주기 이상 탐지와 선박 재원 유효성 검증을 수행한다.
+    """
+    now_kst = pendulum.now(KST)
+    end_dt = now_kst
+    start_dt = now_kst.subtract(hours=1)
+
+    logger.info("Type5 무결성 분석: %s ~ %s (KST)", start_dt, end_dt)
+    msg5_integrity_analysis.run(start_dt=start_dt, end_dt=end_dt)
+
+
 # ──────────────────────────────────────────────────────────────
 # DAG 정의
 # ──────────────────────────────────────────────────────────────
@@ -110,4 +125,9 @@ with DAG(
         python_callable=run_rssi,
     )
 
-    process_task >> [report_analysis_task, rssi_analysis_task]
+    msg5_integrity_task = PythonOperator(
+        task_id="msg5_integrity_task",
+        python_callable=run_msg5_integrity,
+    )
+
+    process_task >> [report_analysis_task, rssi_analysis_task, msg5_integrity_task]

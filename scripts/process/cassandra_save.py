@@ -67,13 +67,15 @@ ais_static_voyage 매핑 (타입 5):
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from cassandra.cluster import Cluster
 
 # ──────────────────────────────────────────────────────────────
 # 설정
 # ──────────────────────────────────────────────────────────────
+KST = timezone(timedelta(hours=9))
+
 CASSANDRA_HOST     = os.getenv("CASSANDRA_HOST", "localhost")
 CASSANDRA_PORT     = 9042
 CASSANDRA_KEYSPACE = "dlim"
@@ -210,7 +212,10 @@ def _save_static_voyage(record: dict, payload: dict) -> None:
 
     db_str = record.get("dataBucket")
     db_dt = _parse_data_bucket(db_str)
-    received_at = datetime.now()
+    if db_dt is not None:
+        received_at = db_dt.replace(tzinfo=KST).astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        received_at = datetime.utcnow()
 
     call_sign = payload.get("callSign")
     if call_sign is not None and not isinstance(call_sign, str):
