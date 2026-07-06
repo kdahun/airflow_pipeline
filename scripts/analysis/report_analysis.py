@@ -26,6 +26,8 @@ from cassandra.query import SimpleStatement
 
 logger = logging.getLogger(__name__)
 
+
+# 카산드라 기본 정보들
 CASSANDRA_HOST = os.getenv("CASSANDRA_HOST", "localhost")
 CASSANDRA_PORT = 9042
 CASSANDRA_KEYSPACE = "dlim"
@@ -209,7 +211,7 @@ def _is_slot_valid(row) -> Optional[bool]:
 
 
 # ──────────────────────────────────────────────────────────────
-# 메인 실행 함수
+# 메인 실행 함수 - data_pipeline.py에서 run 함수 실행
 # ──────────────────────────────────────────────────────────────
 
 def run(start_dt: datetime, end_dt: datetime) -> None:
