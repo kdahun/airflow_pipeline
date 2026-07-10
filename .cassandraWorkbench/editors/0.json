@@ -1,0 +1,1 @@
+{"id":"LU3bM8ZkVm2CvER4","body":"  SELECT mmsi, date_bucket, toa, rssi, sentence_id, slot_num, snr, station_mmsi,\n  talker_id\n  FROM dlim.signal_information\n  LIMIT 500;","filename":"script_2.cql","clusterName":"Cluster PasswordAuthenticator","keyspace":"dlim","source":"action","modified":true}
